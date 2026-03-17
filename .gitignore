@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-link
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+_tmp_*.py
+*.log
+*.txt
+!README.md
+!spec.txt
+
+# Secrets / credentials — NEVER commit these
+.env
+*.env
+secrets.json
+
+# Ray / ML outputs
+ray_results/
+checkpoint_*/
+*.pt
+*.pth
+*.ckpt
+
+# Build logs
+build_log*.txt
+maml_out.txt
+trace.txt
+trace_writer.py
+
+# Docker volumes
+timescaledb_data/
+
+# Misc
+__pycache__/
+read_docx.py
+run_test.py
+DRL_MarketMaking_TechSpec.docx

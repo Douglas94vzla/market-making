@@ -1,0 +1,533 @@
+DOCUMENTO DE ESPECIFICACIÓN TÉCNICA
+Deep Reinforcement Learning Agent
+for Adaptive Market Making on Binance
+Versión 2.0 — Arquitectura de Investigación de Frontera
+Stack: Python 3.11 · Rust (PyO3) · Ray RLLib · Dreamer-v3 · TimescaleDB · GNN
+Clasificación: Uso interno — instrucciones para LLM generador de código
+0. INSTRUCCIONES DE USO PARA EL LLM
+Este documento es un prompt estructurado de alta densidad técnica. El LLM receptor debe leerlo completamente antes de generar cualquier código. Cada sección es un módulo independiente pero interconectado. Respeta el orden de implementación indicado en la Sección 8.
+El documento está organizado en 9 secciones principales:
+Sección 0: estas instrucciones de uso.
+Sección 1: visión general y objetivos del sistema.
+Secciones 2–6: especificación modular de cada capa del sistema.
+Sección 7: stack tecnológico completo con justificaciones.
+Sección 8: orden de implementación recomendado.
+Sección 9: referencias académicas de las que derivan las decisiones de diseño.
+Convención de código: 
+todo pseudocódigo usa tipado estricto (Python 3.11+ type hints). Las firmas de función son contratos; no las cambies sin justificación. Los bloques marcados como 
+# CRÍTICO
+ contienen lógica que, si se altera, rompe el sistema completo.
+Requisito previo de infraestructura: el sistema asume un servidor con mínimo 32 GB RAM, GPU NVIDIA con 16 GB VRAM, y latencia < 5ms a Binance. El módulo Rust requiere Rust 1.75+ con toolchain estable.
+1. VISIÓN GENERAL Y OBJETIVOS DEL SISTEMA
+1.1 Definición del problema
+El market making algorítmico es el proceso de colocar simultáneamente órdenes de compra (bid) y venta (ask) en un libro de órdenes con el objetivo de capturar el spread bid-ask como ganancia, mientras se gestiona el riesgo de inventario que surge cuando el mercado se mueve de forma adversa. El desafío central es que el market maker enfrenta un trade-off fundamental:
+Spreads más amplios → mayor ganancia por trade, menor probabilidad de ejecución.
+Spreads más estrechos → mayor probabilidad de ejecución, menor margen, mayor riesgo de adverse selection.
+El enfoque clásico (Avellaneda-Stoikov, 2008) proporciona una solución analítica óptima bajo supuestos simplificadores. Este sistema usa Avellaneda-Stoikov como prior teórico y entrena un agente DRL para aprender las desviaciones del óptimo en condiciones reales de mercado donde los supuestos se violan continuamente.
+1.2 Objetivos técnicos cuantificables
+Métrica
+Target mínimo
+Target ambicioso
+Sharpe Ratio anualizado
+> 2.0
+> 3.5
+Max Drawdown
+< 15%
+< 8%
+Fill Rate (órdenes ejecutadas)
+> 60%
+> 75%
+Latencia cálculo de estado
+< 500 µs
+< 50 µs (Rust)
+Adverse Selection Rate
+< 30%
+< 20%
+Tiempo convergencia entrenamiento
+< 48 h (CPU)
+< 4 h (GPU cluster)
+1.3 Arquitectura de 5 capas
+El sistema se organiza en 5 capas con responsabilidades estrictamente separadas. La comunicación entre capas es unidireccional hacia abajo (datos → features → agente → ejecución → infraestructura), con retroalimentación del mundo model (Capa 5) hacia el agente (Capa 2) para entrenamiento sintético.
+2. CAPA 1 — GYMNASIUM ENVIRONMENT (MarketMakingEnv)
+2.1 Espacio de observaciones — State Space
+El vector de estado tiene dimensión d = 47 y se normaliza a [-1, 1] usando estadísticas rolling de ventana W = 1000 ticks. La normalización es crítica para la estabilidad del entrenamiento.
+Feature
+Dims
+Rango
+Descripción / Fórmula
+OFI multivariante
+5
+[-1, 1]
+OFI_k = ΔV_bid_k - ΔV_ask_k para niveles k=1..5
+VPIN
+1
+[0, 1]
+Vol-sync Prob. Informed Trading (Easley et al.)
+Kyle lambda
+1
+[0, ∞)
+λ = Δp / sign(flow) × volume, ventana 100 trades
+Spread relativo
+1
+[0, 1]
+(ask - bid) / mid_price
+Volatilidad log-ret.
+3
+[0, 1]
+σ en ventanas de 10s, 60s, 300s
+Inventario relativo
+1
+[-1, 1]
+inventory / max_inventory_limit
+PnL no realizado
+1
+[-1, 1]
+(mid_price - avg_entry_price) × inventory
+Estado HMM (regime)
+4
+[0, 1]
+Prob. de cada régimen: trend+/trend-/mean-rev/high-vol
+Micro-price
+1
+[-1, 1]
+(bid×V_ask + ask×V_bid) / (V_bid + V_ask)
+Embedding GNN cross-asset
+16
+[-1, 1]
+Repr. latente de correlaciones LOB entre N assets
+Momentum multi-escala
+5
+[-1, 1]
+ret_1s, 5s, 30s, 60s, 300s normalizados por ATR
+Amihud illiquidity ratio
+1
+[0, 1]
+|Δp| / volume, proxy de impacto de mercado
+Time-of-day encoding
+2
+[-1, 1]
+sin(2π·t/86400) y cos(2π·t/86400)
+Funding rate (perps)
+1
+[-1, 1]
+Tasa de funding actual de BTCUSDT perpetuo
+VWAP deviation
+3
+[-1, 1]
+(mid - VWAP_k) / σ para ventanas k=30,120,300s
+2.2 Espacio de acción
+El espacio de acción es continuo 3D, lo que permite al agente ajustar simultáneamente tres dimensiones del quote:
+a = (δ_bid, δ_ask, q)  ∈  [0, 5σ] × [0, 5σ] × [0, q_max]
+donde σ es la desviación estándar de precios en la última ventana de 60 segundos, y q_max es el tamaño máximo de orden configurado. El agente puede colocar quotes asimétricas (δ_bid ≠ δ_ask), lo que le permite gestionar inventario sin cancelar órdenes.
+2.2.1 Discretización opcional (modo benchmark)
+Para comparación con baselines, se implementa un espacio discreto de 125 acciones = 5 niveles bid × 5 niveles ask × 5 tamaños. Usar gym.spaces.Discrete(125) con un mapping idx → (δ_bid, δ_ask, q).
+2.3 Función de recompensa — reward shaping crítico
+La función de recompensa es el componente más delicado del sistema. Una especificación incorrecta produce políticas degeneradas (no cotizar nunca, o cotizar spreads infinitos). La función combina tres términos:
+R(t) = PnL_realized(t)  −  λ·inventory(t)²  −  κ·cost_taker(t)  +  ρ·fill_reward(t)
+Término
+Valor típico
+Descripción
+PnL_realized
+variable
+(ask_fill - avg_bid_cost) × qty cuando se completa un ciclo bid→ask. Incluye maker rebate de Binance (0.02% del nocional).
+λ·inventory²
+λ = 0.001
+Penalización cuadrática. Asimétrica: λ_long = 0.001, λ_short = 0.0015 (posiciones cortas más penalizadas en cripto por funding). Se eleva a λ·inventory⁴ cuando |inventory| > 0.8·max_inventory.
+κ·cost_taker
+κ = 0.0007
+Penalización cuando el agente genera órdenes market (taker). Fee de Binance: 0.07% spot, 0.04% futuros. Incentiva órdenes limit (maker).
+ρ·fill_reward
+ρ = 0.0001
+Reward shaping pequeño por cada fill exitoso. Evita la política degenerada de no cotizar. Debe ser menor al PnL esperado para no crear incentivos incorrectos.
+CRÍTICO — Normalización de la recompensa: dividir R(t) por la volatilidad realizada del periodo (σ_30s) para obtener un ratio tipo Sharpe por step. Esto estabiliza el entrenamiento cuando la volatilidad del mercado cambia en órdenes de magnitud.
+2.3.1 Pseudocódigo de la función de recompensa
+def compute_reward(
+    inventory: float,          # posición neta normalizada [-1, 1]
+    realized_pnl: float,       # PnL realizado en el step
+    taker_cost: float,         # costo de órdenes taker (siempre >= 0)
+    fill_occurred: bool,       # si hubo ejecución este step
+    sigma_30s: float,          # volatilidad realizada 30s
+    lambda_base: float = 0.001,
+    kappa: float = 0.0007,
+    rho: float = 0.0001,
+) -> float:
+    # Penalización cuadrática asimétrica
+    if inventory > 0:
+        inv_penalty = lambda_base * inventory ** 2
+    else:
+        inv_penalty = 1.5 * lambda_base * inventory ** 2
+    # Escalado cuártico para inventario extremo  # CRÍTICO
+    if abs(inventory) > 0.8:
+        inv_penalty *= (abs(inventory) / 0.8) ** 2
+    fill_bonus = rho if fill_occurred else 0.0
+    raw_reward = realized_pnl - inv_penalty - kappa * taker_cost + fill_bonus
+    # Normalización por volatilidad  # CRÍTICO para estabilidad
+    return raw_reward / (sigma_30s + 1e-8)
+3. CAPA 2 — ARQUITECTURA DRL (MARL JERÁRQUICO)
+3.1 Diseño multi-agente jerárquico
+Un único agente SAC/PPO no puede optimizar simultáneamente el problema de spread (horizonte: ticks, ~100ms), el de inventario (horizonte: minutos), y el de régimen (horizonte: horas). La arquitectura jerárquica desacopla estos problemas asignando un agente especializado a cada escala temporal.
+Agente
+Algoritmo
+Frecuencia
+Responsabilidad
+Meta-controller
+MAML + SAC
+~1s / 10 ticks
+Detecta régimen (HMM), selecciona sub-política activa, ajusta hiperparámetros de reward (λ, κ).
+Spread agent
+PPO + S4
+Cada tick ~50ms
+Calcula δ_bid y δ_ask óptimos. Input: LOB completo + features micro. Usa S4 para dependencias temporales largas.
+Inventory agent
+SAC + MDP constrained
+Cada 500ms
+Gestiona la posición neta. Implementa solución Avellaneda-Stoikov como reward shaping previo. Puede ejecutar hedge en perps.
+3.2 Arquitectura de red neuronal
+3.2.1 Spread agent — S4 (Structured State Space Sequence Model)
+Usar S4 en lugar de LSTM por su capacidad de capturar dependencias de largo alcance en O(N log N) versus O(N²) de la atención. Crítico para order flow donde eventos de hace 500ms pueden ser altamente predictivos.
+class SpreadAgentNetwork(nn.Module):
+    def __init__(self, obs_dim: int = 47, action_dim: int = 3,
+                 d_model: int = 256, n_layers: int = 4, seq_len: int = 64):
+        # Input projection
+        self.input_proj = nn.Linear(obs_dim, d_model)
+        # S4 layers para dependencias temporales
+        self.s4_layers = nn.ModuleList([S4Layer(d_model) for _ in range(n_layers)])
+        # Actor head (Gaussian policy)
+        self.actor_mean = nn.Linear(d_model, action_dim)
+        self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+        # Critic head (twin Q-networks para SAC)
+        self.critic_q1 = nn.Linear(d_model + action_dim, 1)
+        self.critic_q2 = nn.Linear(d_model + action_dim, 1)
+    def forward(self, obs_seq: torch.Tensor) -> tuple[Tensor, Tensor]:
+        # obs_seq shape: (batch, seq_len, obs_dim)
+        x = self.input_proj(obs_seq)          # (B, T, d_model)
+        for layer in self.s4_layers:
+            x = layer(x) + x                  # residual connection
+        x_last = x[:, -1, :]                  # tomar último estado
+        mean = torch.tanh(self.actor_mean(x_last))
+        std  = self.actor_log_std.exp().clamp(1e-3, 1.0)
+        return mean, std
+3.2.2 Meta-controller — MAML (Model-Agnostic Meta-Learning)
+El meta-controller se entrena con MAML para adaptarse rápidamente (en 5-10 gradient steps) a un nuevo régimen de mercado usando solo los últimos 500 trades como soporte. Esto elimina la necesidad de reentrenar desde cero cuando el mercado cambia de régimen.
+# Proceso MAML (inner loop)
+def maml_inner_loop(
+    meta_params: dict,
+    support_batch: Batch,   # últimos 500 trades del nuevo régimen
+    inner_lr: float = 0.01,
+    n_inner_steps: int = 5,
+) -> dict:
+    adapted_params = meta_params.copy()
+    for _ in range(n_inner_steps):
+        loss = compute_regime_loss(adapted_params, support_batch)
+        grads = torch.autograd.grad(loss, adapted_params.values())
+        adapted_params = {k: v - inner_lr * g
+                          for (k, v), g in zip(adapted_params.items(), grads)}
+    return adapted_params
+3.3 Hiperparámetros de entrenamiento
+Hiperparámetro
+Valor
+Justificación
+Learning rate actor (PPO)
+3e-4
+Adam con cosine annealing, T_max=1M steps
+Learning rate crítico (SAC)
+1e-3
+Crítico aprende más rápido que actor en SAC
+Clip epsilon (PPO)
+0.15
+Reducido vs default 0.2 para trading (políticas sensibles)
+Entropy coefficient α (SAC)
+auto-tuned
+Target entropy = -dim(action) × 0.5
+Batch size
+4096
+Suficientemente grande para estimación estable del gradient
+Replay buffer size (SAC)
+2M transitions
+Prioritized Experience Replay (PER) con α=0.6
+Discount factor γ
+0.999
+Horizonte largo: el agente valora el PnL futuro fuertemente
+GAE lambda (PPO)
+0.95
+Trade-off bias-variance estándar
+Gradient clip norm
+0.5
+Crítico para estabilidad en mercados con picos de volatilidad
+Environments vectorizados
+64–256
+Ray RLLib SubprocVecEnv en cluster de N GPUs
+4. CAPA 5 — WORLD MODEL Y SIMULACIÓN (MBRL)
+4.1 Dreamer-v3 para market making
+El problema fundamental del DRL en trading es la eficiencia de datos. El agente no puede explorar libremente — cada exploración tiene costo real. Dreamer-v3 (Hafner et al., 2023) resuelve esto entrenando un world model que predice la dinámica del mercado, permitiendo rollouts completamente sintéticos ('en imaginación').
+Ganancia de eficiencia: en experimentos de mercados equitativos, Dreamer-v3 alcanza el mismo nivel de política que PPO puro con ~10x menos datos reales, y ~50x menos steps en entornos con dinámica compleja.
+4.1.1 Componentes del world model
+El world model de Dreamer-v3 tiene 4 redes neuronales entrenadas conjuntamente:
+Representation model: q(z_t | z_{t-1}, a_{t-1}, o_t) — codifica observaciones reales en estados latentes z_t usando RSSM (Recurrent State Space Model).
+Transition model: p(z_t | z_{t-1}, a_{t-1}) — predice estados latentes futuros dado un estado y acción, SIN ver la observación real. Crítico para los rollouts sintéticos.
+Reward model: p(r_t | z_t) — predice el reward desde el estado latente.
+Decoder (opcional en inferencia): p(o_t | z_t) — reconstruye la observación para regularización del entrenamiento del world model.
+4.1.2 Proceso de entrenamiento híbrido
+# Fase 1: Recolección de datos reales (mínimo viable)
+collect_real_trajectories(
+    n_episodes=500,       # ~50,000 ticks de datos reales
+    policy=random_policy, # exploración inicial
+    replay_buffer=buffer,
+)
+# Fase 2: Entrenamiento del world model
+for step in range(world_model_steps):
+    batch = buffer.sample(batch_size=16, seq_len=64)
+    wm_loss = rssm_loss(batch) + reward_pred_loss(batch)
+    wm_optimizer.step(wm_loss)
+# Fase 3: Entrenamiento del agente en imaginación  # CRÍTICO
+for step in range(imagination_steps):
+    z_init = world_model.encode(real_obs_batch)
+    imagined_traj = world_model.rollout(
+        z_start=z_init,
+        policy=agent,
+        horizon=15,  # 15 steps hacia el futuro
+    )
+    agent_loss = compute_actor_critic_loss(imagined_traj)
+    agent_optimizer.step(agent_loss)
+4.2 Neural LOB Simulator
+Complementando a Dreamer-v3, se entrena un simulador de libro de órdenes dedicado con arquitectura Mamba (Gu & Dao, 2023) — los State Space Models son superiores a Transformers para secuencias largas de ticks porque su complejidad es O(N) versus O(N²).
+El simulador aprende la distribución condicional del próximo estado del LOB dado el estado actual y la acción del market maker, incluyendo el impacto de precio (slippage) modelado según Almgren-Chriss:
+ΔP_impact = η × sign(Q) × |Q|^δ  +  ε_t
+donde 
+η
+ es el coeficiente de impacto permanente (calibrado con datos históricos), 
+δ ≈ 0.6
+ es el exponente de impacto de mercado (Bacry et al., 2015), y 
+ε_t
+ es ruido de mercado.
+5. CAPA 0+1 — PIPELINE DE DATOS Y FEATURES EN RUST
+5.1 Arquitectura del pipeline de datos
+El pipeline de datos usa una arquitectura asíncrona basada en tokio (Rust) para ingestión de WebSocket y cálculo de features, con una interfaz PyO3 hacia Python para el entorno Gymnasium.
+Módulo
+Lenguaje
+Responsabilidad
+ws_client.rs
+Rust (tokio)
+WebSocket a Binance. Reconnect automático con exponential backoff. Buffer circular de 10,000 eventos.
+lob_state.rs
+Rust
+Mantiene el LOB completo en memoria usando BTreeMap ordenado. Actualización O(log N) por evento.
+features.rs
+Rust (SIMD)
+Cálculo vectorizado de todos los features. Usa AVX2 vía std::simd para OFI y VPIN en bulk.
+py_bridge.rs
+Rust + PyO3
+Expone FeatureEngine como clase Python. Zero-copy con numpy via PyArray.
+hmm_regime.py
+Python (hmmlearn)
+HMM con 4 estados. Se reentrena semanalmente. Output: vector de probabilidades de régimen.
+gnn_cross_asset.py
+PyTorch Geometric
+GNN que procesa LOBs de N assets en paralelo. Output: embedding 16-dim por asset.
+5.2 Interfaz Rust-Python (PyO3)
+// features.rs — interfaz PyO3 (Rust)
+#[pyclass]
+pub struct FeatureEngine {
+    lob: Arc<RwLock<LimitOrderBook>>,
+    trade_buffer: VecDeque<Trade>,  // últimos 10,000 trades
+    vpin_buckets: VecDeque<VpinBucket>,
+}
+#[pymethods]
+impl FeatureEngine {
+    /// Retorna el vector de estado como numpy array (zero-copy)
+    fn compute_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let features = self.compute_all_features();  // < 50 µs target
+        Ok(PyArray1::from_vec_bound(py, features))
+    }
+    /// Actualiza LOB con un delta de Binance
+    fn update_lob(&mut self, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) {
+        let mut lob = self.lob.write().unwrap();
+        lob.apply_delta(bids, asks);
+    }
+}
+5.3 Cálculo de VPIN
+VPIN (Volume-weighted Probability of Informed Trading, Easley et al., 2012) es el feature de microestructura más predictivo de crashes de liquidez. El cálculo correcto es:
+VPIN = (1/n) × Σ_{k=1}^{n} |V_buy_k − V_sell_k| / V_bucket
+donde cada bucket k acumula V_bucket en volumen de transacciones, y V_buy/V_sell se estima clasificando cada trade con el algoritmo de Lee-Ready (comparación con mid-price).
+fn compute_vpin(
+    buckets: &VecDeque<VpinBucket>,
+    window: usize,  // número de buckets (típicamente 50)
+) -> f64 {
+    let n = buckets.len().min(window);
+    let sum: f64 = buckets.iter().rev().take(n)
+        .map(|b| (b.buy_vol - b.sell_vol).abs() / b.total_vol)
+        .sum();
+    sum / n as f64
+}
+6. BACKTESTING REALISTA Y GESTIÓN DE RIESGOS
+6.1 Motor de backtesting con microestructura real
+El backtesting naive (fill al precio teórico) sobrestima el PnL real por factores de 2x a 5x. El simulador debe modelar explícitamente:
+Factor
+Implementación requerida
+Latencia de red
+Samplear latencia de distribución log-normal: μ=2ms, σ=0.5ms para co-location. Aplicar como delay entre decisión y envío de orden.
+Latencia de matching engine
+Adicional 0.1ms-1ms en el matching engine de Binance. Modelar con distribución exponencial.
+Cola del order book
+Una orden limit en nivel 1 NO se ejecuta instantáneamente. Se asume posición al final de la cola. Fill cuando el volumen acumulado previo es ejecutado.
+Adverse selection
+Si una orden es tomada en < 50ms de su colocación: 40% probabilidad de ser adverse (el precio se moverá en contra). Aplicar penalización adicional de 0.5 bps.
+Impacto de precio
+Para órdenes > 0.1% del volumen medio del nivel 1, aplicar modelo Almgren-Chriss. Slippage = η × (Q/V_avg)^δ × σ.
+Cancelaciones parciales
+Modelar que el 5-15% de las órdenes limit propias son 'sniped' (canceladas por otro participante que las detecta) antes de llegar al matching engine.
+6.2 Sistema de circuit breakers
+El circuit breaker es el sistema de seguridad crítico. Debe operar independientemente del agente DRL — si el agente falla o produce acciones degeneradas, el circuit breaker detiene el sistema y liquida posiciones.
+class CircuitBreaker:
+    def __init__(
+        self,
+        max_drawdown_pct: float = 0.05,   # 5% del capital
+        max_inventory_notional: float = 10_000,  # USD
+        vol_multiplier: float = 3.0,      # 3x vol histórica = flash crash
+        max_position_age_s: float = 300,  # 5 min max holding
+        daily_loss_limit: float = 0.02,   # 2% capital/día
+    ):
+        ...
+    def check(self, state: MarketState, portfolio: Portfolio) -> Action:
+        # Trigger 1: Drawdown desde peak
+        if portfolio.drawdown_from_peak() > self.max_drawdown_pct:
+            return Action.EMERGENCY_LIQUIDATE
+        # Trigger 2: Volatilidad extrema (flash crash)  # CRÍTICO
+        current_vol = state.realized_vol_1min
+        if current_vol > self.vol_multiplier * state.historical_vol_30d:
+            return Action.CANCEL_ALL_PAUSE_30S
+        # Trigger 3: Inventario stale
+        if portfolio.max_position_age() > self.max_position_age_s:
+            return Action.FORCE_FLATTEN
+        # Trigger 4: Pérdida diaria acumulada
+        if portfolio.daily_pnl() < -self.daily_loss_limit * portfolio.capital:
+            return Action.SHUTDOWN_TODAY
+        return Action.CONTINUE
+7. STACK TECNOLÓGICO COMPLETO
+Capa
+Tecnología
+Justificación técnica
+DRL core
+Ray RLLib 2.x
+Entrenamiento distribuido nativo. SubprocVecEnv con 256 environments paralelos. Integración directa con S4 y arquitecturas custom.
+Algoritmo spread
+PPO + S4 (PyTorch)
+S4 captura dependencias largas en O(N log N). Superior a LSTM para secuencias de ticks donde eventos de hace 500ms son predictivos.
+Algoritmo inventario
+SAC constrained MDP
+SAC con Lagrangian para restricciones de inventario. Más estable que PPO para espacios de acción continuos.
+World model
+Dreamer-v3
+MBRL: 10-50x mayor eficiencia de datos vs model-free. Permite explorar en imaginación sin costo real.
+LOB simulator
+Mamba (S6) PyTorch
+Complejidad O(N) para secuencias de ticks largas. Superior a Transformer para simulación de LOB.
+Meta-learning
+learn2learn (MAML)
+Adaptación en 5-10 gradient steps a nuevo régimen. Eliminina reentrenamiento completo.
+Features críticos
+Rust 1.75+ PyO3 SIMD
+OFI, VPIN, Kyle-λ calculados en < 50 µs con AVX2. Zero-copy a numpy.
+Cross-asset GNN
+PyTorch Geometric
+GraphSAGE sobre grafo de N assets. Edge features: correlación OFI, funding rate spread.
+Régimen HMM
+hmmlearn / Pomegranate
+4 estados ocultos. Features de emisión: log-retorno, volumen, spread. Reentrenamiento semanal.
+Base de datos
+TimescaleDB 2.x
+PostgreSQL con extensión de series temporales. 90% compresión vs CSV. Queries de ventanas temporales en ms.
+Monitoreo
+Grafana + Prometheus
+Dashboard de PnL en tiempo real, latencia p99, fill rate, inventario, regime state.
+MLOps
+MLflow + KS-drift
+Tracking de experimentos. Test KS rolling para detección de drift. Auto-reentrenamiento al superar umbral.
+Deployment
+Docker + K8s
+3 pods: ingestor Rust, agente Python, monitor. HPA basado en latencia.
+7.1 Dependencias Python (requirements.txt)
+# Core DRL
+ray[rllib]==2.9.0
+torch==2.2.0
+gymnasium==0.29.1
+stable-baselines3==2.2.1  # fallback / baseline comparison
+# Arquitecturas
+torch-state-spaces==0.2.0  # S4 implementation
+mamba-ssm==1.2.0           # Mamba (S6)
+torch-geometric==2.4.0     # GNN
+learn2learn==0.2.0         # MAML
+# World model
+dreamer-pytorch==3.0.0     # Dreamer-v3 PyTorch port
+# Data & Features
+python-binance==1.0.19
+websockets==12.0
+hmmlearn==0.3.2
+timescaledb-python==0.1.0  # via psycopg2
+# MLOps
+mlflow==2.10.0
+prometheus-client==0.19.0
+scipy==1.12.0              # KS test
+8. ORDEN DE IMPLEMENTACIÓN RECOMENDADO
+Implementar en este orden exacto. Cada fase produce un artefacto testeable antes de avanzar. No saltar fases — la Fase 3 depende de datos reales de la Fase 1.
+Fase
+Módulo
+Duración est.
+Criterio de éxito
+1
+Pipeline WS + LOB (Python)
+2-3 días
+Recibir y almacenar 1M ticks de BTCUSDT sin pérdidas en TimescaleDB.
+2
+MarketMakingEnv base (Gymnasium)
+3-4 días
+env.step() y env.reset() sin errores. Random policy genera PnL ≈ 0 (señal de que el ambiente es neutral).
+3
+Backtester con microestructura
+3-4 días
+Avellaneda-Stoikov teórico genera Sharpe > 1.0 sobre datos históricos.
+4
+PPO baseline (agente simple)
+2-3 días
+Agente PPO converge a Sharpe > 0.5 en backtesting. Proof of concept.
+5
+HMM + features extendidos
+2-3 días
+Detector de régimen con accuracy > 70% en datos históricos etiquetados manualmente.
+6
+World model (Dreamer-v3)
+4-5 días
+World model predice reward con error < 20% en set de validación. Rollouts sintéticos producen distribución similar a datos reales (KS test p > 0.05).
+7
+MARL jerárquico completo
+5-7 días
+Sistema completo alcanza Sharpe > 2.0 en backtesting con datos out-of-sample.
+8
+Features Rust (PyO3)
+3-4 días
+Latencia compute_state() < 50 µs (percentil 99). Resultados numéricament idénticos a implementación Python.
+9
+GNN cross-asset
+3-4 días
+Embedding mejora Sharpe en +0.3 vs baseline sin GNN (ablation study).
+10
+Testnet live + monitoring
+3-5 días
+Sistema opera 72h continuas en Binance Testnet sin crasheos. PnL simulado consistent con backtesting (error < 30%).
+No pasar a producción real (capital real) sin al menos 2 semanas de operación continua en Testnet con métricas estables y circuit breaker probado.
+9. REFERENCIAS ACADÉMICAS
+Las siguientes publicaciones son la base teórica de las decisiones de diseño. El LLM debe consultar estas referencias para cualquier duda sobre las implementaciones.
+Avellaneda, M. & Stoikov, S. (2008). High-frequency trading in a limit order book. Quantitative Finance, 8(3), 217–224. — Base teórica de la solución analítica de market making.
+Easley, D., López de Prado, M. M., & O'Hara, M. (2012). Flow Toxicity and Liquidity in a High-Frequency World. Review of Financial Studies, 25(5), 1457–1493. — Definición y cálculo de VPIN.
+Cont, R., Kukanov, A., & Stoikov, S. (2014). The Price Impact of Order Book Events. Journal of Financial Econometrics, 12(1), 47–88. — OFI multivariante y su poder predictivo.
+Hafner, D., Lillicrap, T., Norouzi, M., & Ba, J. (2023). Mastering Diverse Domains through World Models (Dreamer-v3). arXiv:2301.04104. — Arquitectura RSSM y entrenamiento en imaginación.
+Gu, A. & Dao, T. (2023). Mamba: Linear-Time Sequence Modeling with Selective State Spaces. arXiv:2312.00752. — Arquitectura para el neural LOB simulator.
+Gu, A., Goel, K., & Ré, C. (2022). Efficiently Modeling Long Sequences with Structured State Spaces (S4). ICLR 2022. — Arquitectura del spread agent.
+Finn, C., Abbeel, P., & Levine, S. (2017). Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks (MAML). ICML 2017. — Base del meta-controller.
+Almgren, R. & Chriss, N. (2001). Optimal execution of portfolio transactions. Journal of Risk, 3(2), 5–39. — Modelo de impacto de precio para el backtester.
+Kyle, A. S. (1985). Continuous Auctions and Insider Trading. Econometrica, 53(6), 1315–1335. — Kyle's lambda como medida de iliquidez.
+Amihud, Y. (2002). Illiquidity and stock returns: cross-section and time-series effects. Journal of Financial Markets, 5(1), 31–56. — Amihud illiquidity ratio.
+Haarnoja, T., Zhou, A., Abbeel, P., & Levine, S. (2018). Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning. ICML 2018. — Base del algoritmo SAC.
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., & Klimov, O. (2017). Proximal Policy Optimization Algorithms. arXiv:1707.06347. — Base del algoritmo PPO.
+Bacry, E., Mastromatteo, I., & Muzy, J.-F. (2015). Hawkes Processes in Finance. Market Microstructure and Liquidity, 1(1). — Modelado de impacto temporal de las órdenes.
+Schmitt, N. & Westerhoff, F. (2023). Market Maker Inventories and Market Stability. Journal of Economic Dynamics and Control. — Gestión óptima de inventario en condiciones de estrés.
