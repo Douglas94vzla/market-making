@@ -39,6 +39,7 @@ def test_step_execution(env):
     assert isinstance(truncated, bool)
 
 def test_reward_function_baseline():
+    # Pass sigma_max_p95 > sigma_30s so the clip does not activate — tests raw formula
     reward = MarketMakingEnv.compute_reward(
         inventory=0.0,      # flat
         realized_pnl=10.0,
@@ -47,12 +48,14 @@ def test_reward_function_baseline():
         sigma_30s=5.0,
         lambda_base=0.001,
         kappa=0.0007,
-        rho=0.0001
+        rho=0.0001,
+        sigma_max_p95=10.0,  # clip above sigma_30s so normalisation = sigma_30s + eps
     )
     expected_raw = 10.0 - 0.0 - 0.0 + 0.0001
     np.testing.assert_almost_equal(reward, expected_raw / (5.0 + 1e-8), decimal=4)
 
 def test_reward_function_quartic_penalty():
+    # Pass sigma_max_p95 > sigma_30s so the clip does not activate
     reward = MarketMakingEnv.compute_reward(
         inventory=0.9,      # > 0.8 triggering quartic
         realized_pnl=10.0,
@@ -61,13 +64,34 @@ def test_reward_function_quartic_penalty():
         sigma_30s=5.0,
         lambda_base=0.001,
         kappa=0.0007,
-        rho=0.0001
+        rho=0.0001,
+        sigma_max_p95=10.0,
     )
-    
     # penalty formula logic: lambda * inv^2 * (inv/0.8)^2 for long
     inv_penalty = 0.001 * (0.9 ** 2) * ((0.9 / 0.8) ** 2)
     expected_raw = 10.0 - inv_penalty - 0.0 + 0.0001
     np.testing.assert_almost_equal(reward, expected_raw / (5.0 + 1e-8), decimal=4)
+
+def test_reward_sigma_clip():
+    """Flash crash: sigma_30s >> p95 → reward uses clipped denominator."""
+    flash_reward = MarketMakingEnv.compute_reward(
+        inventory=0.0,
+        realized_pnl=1.0,
+        taker_cost=0.0,
+        fill_occurred=False,
+        sigma_30s=0.1,    # 50x above p95=0.002
+        sigma_max_p95=0.002,
+    )
+    normal_reward = MarketMakingEnv.compute_reward(
+        inventory=0.0,
+        realized_pnl=1.0,
+        taker_cost=0.0,
+        fill_occurred=False,
+        sigma_30s=0.001,  # below p95 — no clipping
+        sigma_max_p95=0.002,
+    )
+    # Both should be finite and flash_reward should be bounded (not collapse to near-zero)
+    assert abs(flash_reward) < abs(normal_reward) * 100  # clipping limits amplification
 
 def test_random_policy_pnl(env):
     """

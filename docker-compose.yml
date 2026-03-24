@@ -9,10 +9,60 @@ services:
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=market_making
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
     restart: always
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: market_making_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: market_making_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Service 1: Data collection pipeline (runs in background 24/7)
+  trading_app:
+    build: .
+    container_name: market_making_app
+    depends_on:
+      - timescaledb
+    env_file:
+      - .env
+    environment:
+      - DB_URL=postgres://postgres:password@timescaledb:5432/market_making
+    command: ["python", "src/run.py", "--symbol", "BTCUSDT", "--mode", "pipeline", "--duration", "0"]
+    restart: always
+
+  # Service 2: A-S Paper Trader (Binance Testnet, no real money)
+  as_trader:
+    build: .
+    container_name: market_making_as_trader
+    depends_on:
+      - timescaledb
+    env_file:
+      - .env
+    environment:
+      - BINANCE_TESTNET=true
+    command: ["python", "src/run.py", "--symbol", "BTCUSDT", "--mode", "trade", "--duration", "0"]
+    restart: always
+
 volumes:
   timescaledb_data:
+  prometheus_data:
+  grafana_data:

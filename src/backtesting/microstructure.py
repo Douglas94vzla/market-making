@@ -33,17 +33,39 @@ class LatencyModel:
 
 class AdverseSelectionModel:
     """
-    If a limit order is taken under 50ms of placement, simulate 
-    a 40% probability that the price moves against the trader.
+    If a limit order is taken under 50ms of placement, simulate adverse price movement.
+    # Fixed: original used a fixed 40% probability regardless of market regime.
+    # In high-volatility regimes, adverse selection is significantly higher (up to ~54%).
+    # Probability now varies with the HMM regime probability vector.
     Penalty: 0.5 bps.
     """
-    def __init__(self, threshold_ms: float = 50.0, prob: float = 0.4, penalty_bps: float = 0.5):
+    def __init__(self, threshold_ms: float = 50.0, base_prob: float = 0.4, penalty_bps: float = 0.5, prob: float = None):
         self.threshold = threshold_ms
-        self.prob = prob
-        self.penalty = penalty_bps / 10000.0 # bps to decimal
+        self.base_prob = prob if prob is not None else base_prob  # `prob` kept for backward compatibility
+        self.penalty = penalty_bps / 10000.0  # bps to decimal
 
-    def apply(self, exec_params: OrderExecutionParameters, time_in_book_ms: float) -> OrderExecutionParameters:
-        if time_in_book_ms < self.threshold and np.random.rand() < self.prob:
+    def _adverse_selection_prob(self, regime_probs: Optional[np.ndarray] = None, base: Optional[float] = None) -> float:
+        """
+        Regime-aware adverse selection probability.
+        regime_probs: shape (4,) — [trend+, trend-, mean-rev, high-vol]
+        High-vol regime (index 3) has highest adverse selection multiplier.
+        # Fixed: fixed 40% overestimates PnL in calm regimes and underestimates risk in volatile ones
+        """
+        if regime_probs is None:
+            return base if base is not None else self.base_prob
+        b = base if base is not None else self.base_prob
+        regime_weights = np.array([0.85, 0.90, 0.70, 1.35])  # multipliers per regime
+        effective_multiplier = float(np.dot(regime_probs, regime_weights))
+        return min(b * effective_multiplier, 0.85)  # cap at 85%
+
+    def apply(
+        self,
+        exec_params: OrderExecutionParameters,
+        time_in_book_ms: float,
+        regime_probs: Optional[np.ndarray] = None,
+    ) -> OrderExecutionParameters:
+        prob = self._adverse_selection_prob(regime_probs)
+        if time_in_book_ms < self.threshold and np.random.rand() < prob:
             # Price moves adversely (if buy, we paid higher; if sell, we sold lower)
             if exec_params.side == 'buy':
                 exec_params.price *= (1 + self.penalty)
