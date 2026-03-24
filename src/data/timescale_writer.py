@@ -5,7 +5,8 @@ from typing import List, Tuple, Optional
 import asyncpg
 from datetime import datetime, timezone
 
-logger = logging.getLogger(__name__)
+import structlog
+logger = structlog.get_logger()
 
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS lob_snapshots (

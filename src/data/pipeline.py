@@ -10,7 +10,13 @@ from .ws_client import BinanceWSClient, LOBSnapshot, TradeEvent
 from .lob_state import LimitOrderBook
 from .timescale_writer import TimescaleDBWriter
 
-# Configure structlog
+# Configure logging to work with structlog
+logging.basicConfig(
+    format="%(message)s",
+    stream=sys.stdout,
+    level=logging.INFO,
+)
+
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -21,6 +27,7 @@ structlog.configure(
     logger_factory=structlog.PrintLoggerFactory(),
 )
 logger = structlog.get_logger()
+# Also redirect standard logging to structlog if needed, but basicConfig is enough for now
 
 class DataPipeline:
     def __init__(self, symbol: str, db_url: str, api_key: Optional[str] = None, api_secret: Optional[str] = None):
@@ -88,8 +95,13 @@ class DataPipeline:
                 pass
 
         try:
+            logger.info("Connecting to Database...", dsn=self.db_writer.db_url)
             await self.db_writer.connect()
+            logger.info("Database Connected.")
+            
+            logger.info("Starting Binance WebSocket Client...")
             await self.ws_client.start()
+            logger.info("WebSocket Client Started.")
             
             # Start consumer loop
             consumer_task = asyncio.create_task(self._process_events())

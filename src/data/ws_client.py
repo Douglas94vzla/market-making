@@ -8,7 +8,8 @@ import time
 
 from binance import AsyncClient, BinanceSocketManager
 
-logger = logging.getLogger(__name__)
+import structlog
+logger = structlog.get_logger()
 
 @dataclass
 class LOBSnapshot:

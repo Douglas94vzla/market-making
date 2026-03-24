@@ -12,9 +12,11 @@ build/
 
 # Virtual Environments
 venv/
+venv_mm/
 .venv/
 env/
 ENV/
+!src/env/
 
 # pytest
 .pytest_cache/
